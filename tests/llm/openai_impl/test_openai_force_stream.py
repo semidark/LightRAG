@@ -225,6 +225,53 @@ async def test_force_stream_mid_stream_failure_is_retryable(no_retry_wait):
 
 @pytest.mark.offline
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        # Cut off cleanly mid-generation: partial content, no finish chunk.
+        [_chunk(content='{"entities": [1, '), _chunk(content="2")],
+        # Partial content followed by a usage chunk but still no finish_reason.
+        [
+            _chunk(content='{"entities": ['),
+            SimpleNamespace(usage=_usage(*USAGE), choices=[]),
+        ],
+        # Endpoint ignored stream=True: the SDK yields no chunks at all.
+        [],
+    ],
+    ids=["partial", "partial_with_usage", "no_chunks"],
+)
+async def test_force_stream_without_finish_reason_is_retryable(chunks, no_retry_wait):
+    """An incomplete stream is never returned (or cached) as a finished answer."""
+    streams = []
+
+    async def create(**kwargs):
+        stream = _FakeAsyncStream(chunks)
+        streams.append(stream)
+        return stream
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(side_effect=create))
+        ),
+        close=AsyncMock(),
+    )
+    with patch("lightrag.llm.openai.create_openai_async_client", return_value=client):
+        with pytest.raises(RetryError) as exc_info:
+            await openai_complete_if_cache(
+                model="test-model", prompt="Extract entities", force_stream=True
+            )
+
+    inner = exc_info.value.last_attempt.exception()
+    # Exactly the retryable type, not wrapped in a second InvalidResponseError.
+    assert type(inner) is InvalidResponseError
+    assert "without finish_reason" in str(inner)
+    assert inner.__cause__ is None
+    assert client.chat.completions.create.await_count == 3
+    assert streams and all(stream.closed for stream in streams)
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
 async def test_force_stream_keeps_caller_stream_options():
     """Caller-provided stream_options are kept; include_usage is only defaulted."""
     _, client, _ = await _call(

@@ -296,13 +296,25 @@ async def _aggregate_chat_completion_stream(stream: Any) -> Any:
     Only choice index 0 is aggregated (LightRAG never requests ``n > 1``).
     Chunks without ``choices`` (the trailing usage chunk, Azure content-filter
     chunks) only contribute ``usage``.
+
+    Raises:
+        InvalidResponseError: If the stream ends without a ``finish_reason``
+            on choice 0. A complete OpenAI-compatible stream always ends with
+            one, so its absence means the stream was cut off cleanly (for
+            example a proxy closing the SSE response after an upstream
+            failure, or a server that ignored ``stream`` and returned no
+            chunks). The content collected so far may be partial; treating it
+            as a finished answer would hand truncated output to the caller
+            and to the LLM cache without the ``TruncatedResponse`` flag.
     """
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     finish_reason = None
     usage = None
+    chunk_count = 0
 
     async for chunk in stream:
+        chunk_count += 1
         chunk_usage = getattr(chunk, "usage", None)
         if chunk_usage:
             usage = chunk_usage
@@ -319,6 +331,17 @@ async def _aggregate_chat_completion_stream(stream: Any) -> Any:
                     reasoning_parts.append(piece)
             if getattr(choice, "finish_reason", None):
                 finish_reason = choice.finish_reason
+
+    if finish_reason is None:
+        content_len = sum(len(part) for part in content_parts)
+        reasoning_len = sum(len(part) for part in reasoning_parts)
+        raise InvalidResponseError(
+            "Streamed OpenAI response ended without finish_reason "
+            f"(chunks={chunk_count}, content_len={content_len}, "
+            f"reasoning_content_len={reasoning_len}, "
+            f"usage={'yes' if usage else 'no'}): stream was cut off or the "
+            "endpoint does not support streaming"
+        )
 
     message = SimpleNamespace(
         role="assistant",
@@ -430,6 +453,20 @@ async def openai_complete_if_cache(
     a single response before the regular non-streaming handling runs, so the
     return value, truncation flagging, empty-content diagnostics and token
     tracking are identical. Callers that pass ``stream=True`` are unaffected.
+    A stream that ends without a ``finish_reason`` is treated as cut off and
+    raises the retryable ``InvalidResponseError`` (partial content is never
+    returned or cached as a finished answer).
+
+    Two behavioural differences to be aware of:
+    - ``timeout`` changes meaning. The SDK applies it per read, so for a
+      streamed request it bounds the gap *between chunks*, not the whole
+      generation; a slow but steadily streaming completion can run longer than
+      ``timeout``. The overall bound is then the worker's execution timeout
+      (``2 * LLM_TIMEOUT`` by default); set ``max_completion_tokens`` as a
+      runaway guard.
+    - ``stream_options`` is always sent (``include_usage`` defaults to True).
+      The endpoint must accept it; servers or older Azure API versions that
+      reject ``stream_options`` fail with HTTP 400 (not retried).
 
     Args:
         model: The OpenAI model to use. For Azure, this can be the deployment name.
@@ -667,6 +704,12 @@ async def openai_complete_if_cache(
         )
         try:
             response = await _aggregate_chat_completion_stream(stream_response)
+        except InvalidResponseError as e:
+            # Stream ended cleanly but incomplete (no finish_reason). Already
+            # the retryable type with diagnostics; release and re-raise as is.
+            logger.error(f"OpenAI stream aggregation failed: {e}")
+            await _close_quietly(stream_closer, openai_async_client.close)
+            raise
         except Exception as e:
             # Mid-stream failure (connection reset, gateway timeout, SSE error
             # event). Release the stream and client, then surface it as the
