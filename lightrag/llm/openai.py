@@ -41,6 +41,7 @@ from lightrag.llm._error_utils import is_permanent_rate_limit_error
 
 import numpy as np
 import base64
+from types import SimpleNamespace
 from typing import Any, Union
 
 from dotenv import load_dotenv
@@ -282,6 +283,69 @@ def create_openai_async_client(
         return AsyncOpenAI(**merged_configs)
 
 
+async def _aggregate_chat_completion_stream(stream: Any) -> Any:
+    """Fold a Chat Completions chunk stream into a non-streaming response shape.
+
+    Used by ``openai_complete_if_cache`` when ``force_stream`` is set: the
+    request is sent with ``stream=True`` and the chunks are collected here into
+    an object shaped like a non-streaming ``ChatCompletion``
+    (``choices[0].message.content`` / ``.reasoning_content``,
+    ``choices[0].finish_reason``, ``usage``), so the regular non-streaming
+    code path consumes it unchanged.
+
+    Only choice index 0 is aggregated (LightRAG never requests ``n > 1``).
+    Chunks without ``choices`` (the trailing usage chunk, Azure content-filter
+    chunks) only contribute ``usage``.
+    """
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    finish_reason = None
+    usage = None
+
+    async for chunk in stream:
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage:
+            usage = chunk_usage
+        for choice in getattr(chunk, "choices", None) or []:
+            if getattr(choice, "index", 0) not in (0, None):
+                continue
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                piece = getattr(delta, "content", None)
+                if piece:
+                    content_parts.append(piece)
+                piece = getattr(delta, "reasoning_content", None)
+                if piece:
+                    reasoning_parts.append(piece)
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+
+    message = SimpleNamespace(
+        role="assistant",
+        # None (not "") when no content arrived, matching non-streaming responses
+        content="".join(content_parts) if content_parts else None,
+        reasoning_content="".join(reasoning_parts),
+        parsed=None,
+    )
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
+        ],
+        usage=usage,
+    )
+
+
+async def _close_quietly(*closers: Any) -> None:
+    """Await each callable closer, logging (not raising) any failure."""
+    for closer in closers:
+        if not callable(closer):
+            continue
+        try:
+            await closer()
+        except Exception as close_error:
+            logger.warning(f"Failed to close OpenAI resource: {close_error}")
+
+
 # Token-limit-truncated completions (finish_reason == "length") are returned
 # wrapped in TruncatedResponse so the cache layer skips persisting incomplete
 # output. See the "Note on truncated structured output" in the docstring below.
@@ -355,6 +419,18 @@ async def openai_complete_if_cache(
     5. For streaming: COT content is inserted into the content stream with <think> tags.
     6. For non-streaming: COT content is prepended to regular content with <think> tags.
 
+    Note on `force_stream`: some gateways and reverse proxies in front of an
+    OpenAI-compatible backend enforce a read timeout on the upstream response
+    (e.g. nginx ``proxy_read_timeout``, 60 s by default). A non-streaming
+    request sends no bytes until generation has finished, so long generations
+    (large entity-extraction outputs from slower local models) fail with
+    HTTP 504 regardless of ``timeout``. With ``force_stream=True`` a call that
+    did not ask for a stream is sent with ``stream=True`` (plus
+    ``stream_options.include_usage``) and the chunks are aggregated back into
+    a single response before the regular non-streaming handling runs, so the
+    return value, truncation flagging, empty-content diagnostics and token
+    tracking are identical. Callers that pass ``stream=True`` are unaffected.
+
     Args:
         model: The OpenAI model to use. For Azure, this can be the deployment name.
         prompt: The prompt to complete.
@@ -389,6 +465,10 @@ async def openai_complete_if_cache(
                 These will be passed to the client constructor but will be overridden by
                 explicit parameters (api_key, base_url). Supports proxy configuration,
                 custom headers, retry policies, etc.
+            - force_stream: When True and ``stream`` is not True, request a
+                streamed completion and aggregate it into the non-streaming
+                return value (see "Note on `force_stream`"). Not forwarded to
+                the API. Default is False.
 
     Returns:
         The completed text (with integrated COT content if available) or an async iterator
@@ -415,6 +495,10 @@ async def openai_complete_if_cache(
 
     # Extract client configuration options
     client_configs = kwargs.pop("openai_client_configs", {})
+
+    # Transport-only option (never sent to the API): stream non-streaming
+    # calls under the hood. A caller-requested stream is left as is.
+    force_stream = bool(kwargs.pop("force_stream", False)) and not stream
 
     # Deprecation shims: map legacy boolean flags to response_format only when
     # an explicit response_format was not supplied by the caller. Prefer passing
@@ -486,7 +570,13 @@ async def openai_complete_if_cache(
     messages = kwargs.pop("messages", messages)
 
     # Add explicit parameters back to kwargs so they're passed to OpenAI API
-    if stream is not None:
+    if force_stream:
+        kwargs["stream"] = True
+        # Ask for the trailing usage chunk so token tracking keeps working.
+        stream_options = dict(kwargs.get("stream_options") or {})
+        stream_options.setdefault("include_usage", True)
+        kwargs["stream_options"] = stream_options
+    elif stream is not None:
         kwargs["stream"] = stream
     if timeout is not None:
         kwargs["timeout"] = timeout
@@ -569,6 +659,28 @@ async def openai_complete_if_cache(
         except Exception as close_error:
             logger.warning(f"Failed to close OpenAI client: {close_error}")
         raise
+
+    if force_stream and hasattr(response, "__aiter__"):
+        stream_response = response
+        stream_closer = getattr(stream_response, "close", None) or getattr(
+            stream_response, "aclose", None
+        )
+        try:
+            response = await _aggregate_chat_completion_stream(stream_response)
+        except Exception as e:
+            # Mid-stream failure (connection reset, gateway timeout, SSE error
+            # event). Release the stream and client, then surface it as the
+            # retryable InvalidResponseError, like a failed non-streaming call.
+            logger.error(f"OpenAI stream aggregation failed: {e!r}")
+            await _close_quietly(stream_closer, openai_async_client.close)
+            raise InvalidResponseError(
+                f"Failed to aggregate streamed OpenAI response: {e!r}"
+            ) from e
+        except BaseException:
+            # Cancellation (e.g. a worker timeout) while the stream is open:
+            # release the connection before propagating.
+            await _close_quietly(stream_closer, openai_async_client.close)
+            raise
 
     if hasattr(response, "__aiter__"):
 

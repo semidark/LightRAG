@@ -131,11 +131,13 @@ Prefix `OPENAI_LLM_` — shared by the `openai` and `azure_openai` bindings.
 | `OPENAI_LLM_SERVICE_TIER` | str | Service tier for API usage. |
 | `OPENAI_LLM_SAFETY_IDENTIFIER` | str | Safety identifier for content filtering. |
 | `OPENAI_LLM_EXTRA_BODY` | JSON dict | Extra top-level request-body fields, merged into the request. The escape hatch for anything not in this table — vLLM/SGLang chat-template switches, OpenRouter routing and reasoning controls. |
+| `OPENAI_LLM_FORCE_STREAM` | bool | Client-side switch, **not sent to the provider**. Calls that do not request a stream (entity extraction, summaries, keyword extraction) are sent with `stream: true` + `stream_options.include_usage` and the chunks are aggregated into the usual single result. Truncation handling (`finish_reason=length`), empty-response diagnostics, token tracking and LLM cache keys are unchanged; streamed queries are unaffected. Use it when a gateway or reverse proxy in front of the model cuts long non-streaming responses (HTTP 504 after its read timeout, e.g. nginx `proxy_read_timeout` 60 s) — raising `LLM_TIMEOUT` cannot fix that, because no bytes flow until generation ends. Requires an endpoint that supports streaming. |
 
 Notes:
 
 - These options are merged into the Chat Completions request as keyword arguments and
-  forwarded as-is. LightRAG does not validate them against the target model, so a
+  forwarded as-is (except `OPENAI_LLM_FORCE_STREAM`, which is consumed by the client).
+  LightRAG does not validate them against the target model, so a
   parameter your endpoint does not implement surfaces as a provider-side error.
 - A local OpenAI-compatible server that rejects `reasoning_effort` is the usual reason
   to keep that option role-level (`EXTRACT_OPENAI_LLM_REASONING_EFFORT=…`) rather than

@@ -734,6 +734,8 @@ class OpenAILLMOptions(BindingOptions):
     top_p: float = 1.0  # Nucleus sampling parameter (0.0 to 1.0)
     max_tokens: int = None  # Maximum number of tokens to generate(deprecated, use max_completion_tokens instead)
     extra_body: dict = None  # Extra body parameters for OpenRouter of vLLM
+    # Client-side: stream non-streaming calls and aggregate (not sent to the API)
+    force_stream: bool = False
 
     # Help descriptions
     _help: ClassVar[dict[str, str]] = {
@@ -748,6 +750,7 @@ class OpenAILLMOptions(BindingOptions):
         "top_p": "Nucleus sampling parameter (0.0-1.0, lower = more focused)",
         "max_tokens": "Maximum number of tokens to generate (deprecated, use max_completion_tokens instead)",
         "extra_body": 'Extra body parameters for OpenRouter of vLLM (JSON dict, e.g., \'"reasoning": {"reasoning": {"enabled": false}}\')',
+        "force_stream": "Send non-streaming completions (extraction, summaries, keywords) as streamed requests and aggregate the chunks client-side; avoids gateway read timeouts (HTTP 504) on long generations. Not sent to the provider.",
     }
 
 
